@@ -1,6 +1,5 @@
-fastapi==0.109.0
-uvicorn==0.27.0
-httpx==0.26.0
+fastapi==0.115.6
+uvicorn==0.34.0
+pydantic==2.10.6
+httpx==0.28.1  # Будет использоваться в парсерах
 beautifulsoup4==4.12.3
-lxml==5.1.0
-pytz==2024.1
