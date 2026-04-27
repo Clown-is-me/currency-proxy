@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from datetime import datetime, timezone
 import time
-
+import traceback
 
 app = FastAPI(title="Currency Proxy API")
 
@@ -18,9 +18,18 @@ app.add_middleware(
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json",
+    "Accept-Language": "ru-RU,ru;q=0.9",
 }
 
 cache = {"data": None, "updated": 0}
+errors_log = []
+
+def log_error(source: str, error: Exception):
+    msg = f"{source}: {str(error)}"
+    errors_log.append(msg)
+    print(f"❌ {msg}")
+    if len(errors_log) > 10:
+        errors_log.pop(0)
 
 @app.get("/health")
 async def health_check():
@@ -28,189 +37,168 @@ async def health_check():
 
 @app.get("/api/rates")
 async def get_rates():
+    global errors_log
+    errors_log = []  # Очищаем логи при каждом запросе
+    
     try:
-        # Возвращаем кэш если моложе 10 минут
-        if cache["data"] and (time.time() - cache["updated"]) < 600:
+        if cache["data"] and (time.time() - cache["updated"]) < 300:
             return cache["data"]
         
         all_rates = []
         
-        # === 1. NBRB.BY (Официальный курс Нацбанка Беларуси) ===
+        # === 1. NBRB.BY (Нацбанк Беларуси) ===
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                # USD
-                resp = await client.get("https://www.nbrb.by/api/exrates/rates/USD?parammode=2")
-                usd_data = resp.json()
-                all_rates.append({
-                    "bank": "Нацбанк Беларуси",
-                    "currency_from": "USD",
-                    "currency_to": "BYN",
-                    "buy": round(usd_data["Cur_OfficialRate"] * 0.98, 4),
-                    "sell": round(usd_data["Cur_OfficialRate"] * 1.02, 4),
-                    "source": "nbrb_by"
-                })
-                all_rates.append({
-                    "bank": "Нацбанк Беларуси",
-                    "currency_from": "BYN",
-                    "currency_to": "USD",
-                    "buy": round(1/(usd_data["Cur_OfficialRate"] * 1.02), 6),
-                    "sell": round(1/(usd_data["Cur_OfficialRate"] * 0.98), 6),
-                    "source": "nbrb_by"
-                })
+            print("🔄 Запрос к NBRB.by...")
+            async with httpx.AsyncClient(headers=HEADERS, timeout=10.0, follow_redirects=True) as client:
                 
-                # EUR
-                resp = await client.get("https://www.nbrb.by/api/exrates/rates/EUR?parammode=2")
-                eur_data = resp.json()
-                all_rates.append({
-                    "bank": "Нацбанк Беларуси",
-                    "currency_from": "EUR",
-                    "currency_to": "BYN",
-                    "buy": round(eur_data["Cur_OfficialRate"] * 0.98, 4),
-                    "sell": round(eur_data["Cur_OfficialRate"] * 1.02, 4),
-                    "source": "nbrb_by"
-                })
-                all_rates.append({
-                    "bank": "Нацбанк Беларуси",
-                    "currency_from": "BYN",
-                    "currency_to": "EUR",
-                    "buy": round(1/(eur_data["Cur_OfficialRate"] * 1.02), 6),
-                    "sell": round(1/(eur_data["Cur_OfficialRate"] * 0.98), 6),
-                    "source": "nbrb_by"
-                })
-                
-                # RUB (за 100 рублей)
-                resp = await client.get("https://www.nbrb.by/api/exrates/rates/RUB?parammode=2")
-                rub_data = resp.json()
-                rub_rate = rub_data["Cur_OfficialRate"] / 100.0  # Нормализуем к 1 RUB
-                all_rates.append({
-                    "bank": "Нацбанк Беларуси",
-                    "currency_from": "RUB",
-                    "currency_to": "BYN",
-                    "buy": round(rub_rate * 0.98, 4),
-                    "sell": round(rub_rate * 1.02, 4),
-                    "source": "nbrb_by"
-                })
-                all_rates.append({
-                    "bank": "Нацбанк Беларуси",
-                    "currency_from": "BYN",
-                    "currency_to": "RUB",
-                    "buy": round(1/(rub_rate * 1.02), 6),
-                    "sell": round(1/(rub_rate * 0.98), 6),
-                    "source": "nbrb_by"
-                })
-                
+                for curr_code, curr_name in [("USD", "Доллар США"), ("EUR", "Евро"), ("RUB", "Российский рубль")]:
+                    try:
+                        resp = await client.get(f"https://www.nbrb.by/api/exrates/rates/{curr_code}?parammode=2")
+                        print(f"NBRB {curr_code}: статус {resp.status_code}")
+                        
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            rate = data.get("Cur_OfficialRate")
+                            
+                            if rate and rate > 0:
+                                # Для RUB курс за 100 единиц
+                                if curr_code == "RUB":
+                                    rate = rate / 100.0
+                                
+                                buy = round(rate * 0.98, 4)
+                                sell = round(rate * 1.02, 4)
+                                
+                                all_rates.append({
+                                    "bank": "Нацбанк Беларуси",
+                                    "currency_from": curr_code,
+                                    "currency_to": "BYN",
+                                    "buy": buy,
+                                    "sell": sell,
+                                    "source": "nbrb_by"
+                                })
+                                all_rates.append({
+                                    "bank": "Нацбанк Беларуси",
+                                    "currency_from": "BYN",
+                                    "currency_to": curr_code,
+                                    "buy": round(1/sell, 6),
+                                    "sell": round(1/buy, 6),
+                                    "source": "nbrb_by"
+                                })
+                                print(f"✅ NBRB {curr_code}: добавлено 2 курса")
+                        else:
+                            log_error(f"NBRB {curr_code}", Exception(f"HTTP {resp.status_code}"))
+                            
+                    except Exception as e:
+                        log_error(f"NBRB {curr_code}", e)
+                        
         except Exception as e:
-            print(f"NBRB error: {e}")
+            log_error("NBRB общий", e)
         
-        # === 2. ЦБ РФ (Официальный курс) ===
+        # === 2. ЦБ РФ ===
         try:
+            print("🔄 Запрос к CBR.ru...")
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get("https://www.cbr-xml-daily.ru/daily_json.js")
-                cbr_data = resp.json()
                 
-                # USD
-                if "USD" in cbr_data["Valute"]:
-                    usd = cbr_data["Valute"]["USD"]
-                    all_rates.append({
-                        "bank": "ЦБ РФ",
-                        "currency_from": "USD",
-                        "currency_to": "RUB",
-                        "buy": round(usd["Value"] * 0.98, 4),
-                        "sell": round(usd["Value"] * 1.02, 4),
-                        "source": "cbr_ru"
-                    })
-                    all_rates.append({
-                        "bank": "ЦБ РФ",
-                        "currency_from": "RUB",
-                        "currency_to": "USD",
-                        "buy": round(1/(usd["Value"] * 1.02), 6),
-                        "sell": round(1/(usd["Value"] * 0.98), 6),
-                        "source": "cbr_ru"
-                    })
-                
-                # EUR
-                if "EUR" in cbr_data["Valute"]:
-                    eur = cbr_data["Valute"]["EUR"]
-                    all_rates.append({
-                        "bank": "ЦБ РФ",
-                        "currency_from": "EUR",
-                        "currency_to": "RUB",
-                        "buy": round(eur["Value"] * 0.98, 4),
-                        "sell": round(eur["Value"] * 1.02, 4),
-                        "source": "cbr_ru"
-                    })
-                    all_rates.append({
-                        "bank": "ЦБ РФ",
-                        "currency_from": "RUB",
-                        "currency_to": "EUR",
-                        "buy": round(1/(eur["Value"] * 1.02), 6),
-                        "sell": round(1/(eur["Value"] * 0.98), 6),
-                        "source": "cbr_ru"
-                    })
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for curr_code in ["USD", "EUR"]:
+                        if curr_code in data.get("Valute", {}):
+                            v = data["Valute"][curr_code]
+                            rate = v["Value"]
+                            
+                            all_rates.append({
+                                "bank": "ЦБ РФ",
+                                "currency_from": curr_code,
+                                "currency_to": "RUB",
+                                "buy": round(rate * 0.98, 4),
+                                "sell": round(rate * 1.02, 4),
+                                "source": "cbr_ru"
+                            })
+                            all_rates.append({
+                                "bank": "ЦБ РФ",
+                                "currency_from": "RUB",
+                                "currency_to": curr_code,
+                                "buy": round(1/(rate*1.02), 6),
+                                "sell": round(1/(rate*0.98), 6),
+                                "source": "cbr_ru"
+                            })
+                    print(f"✅ CBR: добавлено курсов")
                     
         except Exception as e:
-            print(f"CBR error: {e}")
+            log_error("CBR", e)
         
-        # === 3. Currate.ru (Коммерческие курсы) ===
+        # === 3. Currate.ru ===
         try:
+            print("🔄 Запрос к Currate.ru...")
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
                     "https://currate.ru/api/?get=rates&pairs=USDRUB,EURRUB,BYNRUB,USDBYN,EURBYN,RUBBYN&key=demo"
                 )
-                data = resp.json()
+                print(f"Currate: статус {resp.status_code}")
                 
-                if data.get("status") == "200":
-                    for pair, rate in data.get("data", {}).items():
-                        if len(pair) == 6:
-                            from_curr = pair[:3]
-                            to_curr = pair[3:]
-                            buy = round(rate * 0.985, 4)
-                            sell = round(rate * 1.015, 4)
-                            
-                            all_rates.append({
-                                "bank": f"Currate ({from_curr}/{to_curr})",
-                                "currency_from": from_curr,
-                                "currency_to": to_curr,
-                                "buy": buy,
-                                "sell": sell,
-                                "source": "currate"
-                            })
-                            # Обратная пара
-                            all_rates.append({
-                                "bank": f"Currate ({to_curr}/{from_curr})",
-                                "currency_from": to_curr,
-                                "currency_to": from_curr,
-                                "buy": round(1/sell, 6),
-                                "sell": round(1/buy, 6),
-                                "source": "currate"
-                            })
-                            
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("status") == "200":
+                        for pair, rate in data.get("data", {}).items():
+                            if len(pair) == 6 and rate and rate > 0:
+                                from_c, to_c = pair[:3], pair[3:]
+                                buy = round(rate * 0.985, 4)
+                                sell = round(rate * 1.015, 4)
+                                
+                                all_rates.append({
+                                    "bank": f"Currate",
+                                    "currency_from": from_c,
+                                    "currency_to": to_c,
+                                    "buy": buy,
+                                    "sell": sell,
+                                    "source": "currate"
+                                })
+                                all_rates.append({
+                                    "bank": f"Currate",
+                                    "currency_from": to_c,
+                                    "currency_to": from_c,
+                                    "buy": round(1/sell, 6),
+                                    "sell": round(1/buy, 6),
+                                    "source": "currate"
+                                })
+                        print(f"✅ Currate: добавлено курсов")
+                    else:
+                        log_error("Currate", Exception(f"API статус: {data.get('status')}"))
+                else:
+                    log_error("Currate", Exception(f"HTTP {resp.status_code}"))
+                    
         except Exception as e:
-            print(f"Currate error: {e}")
+            log_error("Currate", e)
         
         result = {
             "status": "ok",
             "updated": datetime.now(timezone.utc).isoformat(),
             "total": len(all_rates),
             "rates": all_rates,
+            "debug_errors": errors_log,
             "sources": {
-                "nbrb_by": "Нацбанк Беларуси (официальный)",
-                "cbr_ru": "ЦБ РФ (официальный)",
-                "currate": "Currate.ru (коммерческие)"
+                "nbrb_by": "Нацбанк Беларуси",
+                "cbr_ru": "ЦБ РФ", 
+                "currate": "Currate.ru"
             }
         }
         
         cache["data"] = result
         cache["updated"] = time.time()
         
+        print(f"📊 Итого: {len(all_rates)} курсов, ошибок: {len(errors_log)}")
         return result
         
     except Exception as e:
+        print(f"❌ Критическая ошибка: {e}")
+        traceback.print_exc()
         return {
             "status": "error",
             "message": str(e),
             "total": 0,
-            "rates": []
+            "rates": [],
+            "debug_errors": errors_log
         }
 
 if __name__ == "__main__":
