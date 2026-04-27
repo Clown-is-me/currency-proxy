@@ -4,6 +4,7 @@ import httpx
 from datetime import datetime, timezone
 import time
 
+
 app = FastAPI(title="Currency Proxy API")
 
 app.add_middleware(
