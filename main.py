@@ -1,187 +1,146 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-import httpx
-from datetime import datetime, timezone
+import os
+import json
 import time
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Optional
 
-app = FastAPI(title="Currency Proxy API")
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("currency-api")
+
+app = FastAPI(title="EUR->BYN Arbitrage Calculator", version="1.0.0")
+
+# CORS для локальной разработки и мобильного приложения
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # В продакшене замените на конкретный домен/packagename
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Заголовки, которые обходят базовую защиту
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    "Referer": "https://www.nbrb.by/",
-    "Origin": "https://www.nbrb.by",
-}
+# --- Конфигурация ---
+CACHE_FILE = Path("rates_cache.json")
+CACHE_TTL_SECONDS = 15 * 60  # Кэш живёт 15 минут
+RENDER_PORT = int(os.environ.get("PORT", 8000))
 
-cache = {"data": None, "updated": 0}
+# --- Pydantic модели ---
+class ChainResult(BaseModel):
+    bank_name: str
+    eur_rub_buy: float
+    rub_byn_buy: float
+    eur_byn_direct: float
+    cross_rate: float
+    profit_coeff: float  # (cross / direct) - 1
+    link: Optional[str] = None
+
+class APIResponse(BaseModel):
+    chains: List[ChainResult]
+    last_updated: str
+    is_cached: bool
+    source_status: str = "ok"
+
+# --- Менеджер кэша ---
+class CacheManager:
+    def __init__(self, ttl: int = CACHE_TTL_SECONDS):
+        self.ttl = ttl
+
+    def load(self) -> Optional[APIResponse]:
+        if not CACHE_FILE.exists():
+            return None
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Проверка срока жизни
+            if time.time() - data.get("timestamp", 0) > self.ttl:
+                logger.info("⏳ Кэш истёк, требуется обновление")
+                return None
+            return APIResponse(**data["payload"])
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка чтения кэша: {e}")
+            return None
+
+    def save(self, response: APIResponse):
+        try:
+            payload = response.model_dump()
+            data = {"timestamp": time.time(), "payload": payload}
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            logger.info("💾 Кэш успешно сохранён")
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения кэша: {e}")
+
+cache_mgr = CacheManager()
+
+# --- Заглушка для Шага 2 и 3 ---
+# Здесь будет подключаться реальный парсер + калькулятор
+async def fetch_and_calculate() -> APIResponse:
+    logger.info("🔍 Запуск парсинга и расчётов...")
+    # TODO: Step 2 → Парсинг banki.ru и myfin.by
+    # TODO: Step 3 → Фильтрация, расчёт cross_rate, сортировка топ-10
+    
+    # Временные моковые данные для проверки работы API
+    mock_chains = [
+        ChainResult(
+            bank_name="ПримерБанк",
+            eur_rub_buy=98.45,
+            rub_byn_buy=0.0318,
+            eur_byn_direct=3.12,
+            cross_rate=98.45 * 0.0318,
+            profit_coeff=(98.45 * 0.0318 / 3.12) - 1,
+            link="https://example.com"
+        )
+    ]
+    return APIResponse(
+        chains=mock_chains,
+        last_updated=datetime.now(timezone.utc).isoformat(),
+        is_cached=False,
+        source_status="mock_data"
+    )
+
+# --- Эндпоинты ---
+@app.get("/api/chains", response_model=APIResponse)
+async def get_chains(force_refresh: bool = Query(False, description="Принудительное обновление")):
+    # 1. Проверяем кэш
+    cached = cache_mgr.load()
+    if cached and not force_refresh:
+        cached.is_cached = True
+        cached.source_status = "cached"
+        return cached
+
+    # 2. Пытаемся получить свежие данные
+    try:
+        fresh_data = await fetch_and_calculate()
+        cache_mgr.save(fresh_data)
+        return fresh_data
+    except Exception as e:
+        logger.error(f"🔥 Ошибка парсинга: {e}")
+        # 3. Fallback: если парсинг упал, отдаём последний кэш (даже если просрочен)
+        fallback = cache_mgr.load()
+        if fallback:
+            fallback.is_cached = True
+            fallback.source_status = "error_fallback_to_cache"
+            return fallback
+        raise HTTPException(status_code=502, detail="Не удалось получить курсы и нет сохранённого кэша")
+
+@app.post("/api/refresh", response_model=APIResponse)
+async def force_refresh():
+    return await get_chains(force_refresh=True)
 
 @app.get("/health")
-async def health_check():
-    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
-
-def add_pair(rates: list, bank: str, from_c: str, to_c: str, mid_rate: float, source: str):
-    """Добавляет прямую и обратную пару с фиксированным спредом ±2%"""
-    if mid_rate <= 0:
-        return
-    buy = round(mid_rate * 0.98, 4)
-    sell = round(mid_rate * 1.02, 4)
-    rates.append({
-        "bank": bank,
-        "currency_from": from_c,
-        "currency_to": to_c,
-        "buy": buy,
-        "sell": sell,
-        "source": source
-    })
-    # Обратная пара
-    if buy > 0 and sell > 0:
-        rates.append({
-            "bank": bank,
-            "currency_from": to_c,
-            "currency_to": from_c,
-            "buy": round(1/sell, 6),
-            "sell": round(1/buy, 6),
-            "source": source
-        })
-
-@app.get("/api/rates")
-async def get_rates():
-    try:
-        # Кэш на 5 минут
-        if cache["data"] and (time.time() - cache["updated"]) < 300:
-            return cache["data"]
-        
-        all_rates = []
-        errors = []
-        
-        # === 1. NBRB.BY (с правильными заголовками) ===
-        try:
-            async with httpx.AsyncClient(headers=HEADERS, timeout=15.0, follow_redirects=True) as client:
-                for curr_code in ["USD", "EUR", "RUB"]:
-                    try:
-                        url = f"https://www.nbrb.by/api/exrates/rates/{curr_code}?parammode=2"
-                        resp = await client.get(url)
-                        
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            rate = data.get("Cur_OfficialRate")
-                            if rate and rate > 0:
-                                # RUB идёт за 100 единиц
-                                if curr_code == "RUB":
-                                    rate = rate / 100.0
-                                add_pair(all_rates, "Нацбанк Беларуси", curr_code, "BYN", rate, "nbrb_by")
-                                print(f"✅ NBRB {curr_code}: {rate}")
-                            else:
-                                errors.append(f"NBRB {curr_code}: пустой курс")
-                        else:
-                            errors.append(f"NBRB {curr_code}: HTTP {resp.status_code}")
-                    except Exception as e:
-                        errors.append(f"NBRB {curr_code}: {str(e)}")
-        except Exception as e:
-            errors.append(f"NBRB общий: {str(e)}")
-        
-        # === 2. ЦБ РФ ===
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get("https://www.cbr-xml-daily.ru/daily_json.js")
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for curr_code in ["USD", "EUR"]:
-                        if curr_code in data.get("Valute", {}):
-                            rate = data["Valute"][curr_code]["Value"]
-                            add_pair(all_rates, "ЦБ РФ", curr_code, "RUB", rate, "cbr_ru")
-                    print(f"✅ CBR: добавлены курсы")
-                else:
-                    errors.append(f"CBR: HTTP {resp.status_code}")
-        except Exception as e:
-            errors.append(f"CBR: {str(e)}")
-        
-        # === 3. АВТО-КРОСС-КУРСЫ (если есть и BYN, и RUB курсы) ===
-        # Считаем: USD→BYN = (USD→RUB) / (BYN→RUB)
-        rub_to_byn = None  # 1 RUB = X BYN
-        usd_to_rub = None
-        eur_to_rub = None
-        
-        for r in all_rates:
-            if r["currency_from"] == "RUB" and r["currency_to"] == "BYN":
-                rub_to_byn = (r["buy"] + r["sell"]) / 2  # Средний курс
-            if r["currency_from"] == "USD" and r["currency_to"] == "RUB":
-                usd_to_rub = (r["buy"] + r["sell"]) / 2
-            if r["currency_from"] == "EUR" and r["currency_to"] == "RUB":
-                eur_to_rub = (r["buy"] + r["sell"]) / 2
-        
-        # Если есть оба компонента — считаем кросс
-        if rub_to_byn and usd_to_rub:
-            usd_to_byn = usd_to_rub * rub_to_byn
-            add_pair(all_rates, "Расчётный кросс", "USD", "BYN", usd_to_byn, "cross_calc")
-            print(f"✅ Кросс USD→BYN: {usd_to_byn:.4f}")
-        
-        if rub_to_byn and eur_to_rub:
-            eur_to_byn = eur_to_rub * rub_to_byn
-            add_pair(all_rates, "Расчётный кросс", "EUR", "BYN", eur_to_byn, "cross_calc")
-            print(f"✅ Кросс EUR→BYN: {eur_to_byn:.4f}")
-        
-        # === 4. Currate (опционально, с обработкой 403) ===
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(
-                    "https://currate.ru/api/?get=rates&pairs=USDRUB,EURRUB,BYNRUB&key=demo"
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get("status") == "200":
-                        for pair, rate in data.get("data", {}).items():
-                            if len(pair) == 6 and rate > 0:
-                                add_pair(all_rates, "Currate", pair[:3], pair[3:], rate, "currate")
-        except:
-            pass  # Игнорируем ошибки Currate, он не критичен
-        
-        # Убираем дубликаты (оставляем первый найденный курс для каждой пары)
-        seen = set()
-        unique_rates = []
-        for r in all_rates:
-            key = (r["currency_from"], r["currency_to"], r["source"])
-            if key not in seen:
-                seen.add(key)
-                unique_rates.append(r)
-        
-        result = {
-            "status": "ok",
-            "updated": datetime.now(timezone.utc).isoformat(),
-            "total": len(unique_rates),
-            "rates": unique_rates,
-            "debug": {
-                "errors": errors[:5],  # Последние 5 ошибок
-                "sources_used": list(set(r["source"] for r in unique_rates))
-            }
-        }
-        
-        cache["data"] = result
-        cache["updated"] = time.time()
-        
-        print(f"📊 Итого: {len(unique_rates)} уникальных курсов")
-        return result
-        
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {
-            "status": "error",
-            "message": str(e),
-            "total": 0,
-            "rates": []
-        }
+async def health():
+    return {
+        "status": "ok",
+        "cache_exists": CACHE_FILE.exists(),
+        "port": RENDER_PORT
+    }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=RENDER_PORT, reload=True)
